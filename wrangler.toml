@@ -1,0 +1,13 @@
+name = "azimo-proxy"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+SUPABASE_URL = "https://yvikqakjdjsyiqrkyoze.supabase.co"
+STRIPE_PUBLISHABLE_KEY = "pk_live_51U2guH7DWMRlw7GbyxjXxhTctD4ozdNOwgJI3ybhzwmNs7yKid4ots0Am6NTVCOefaiNtgVp0CUWzHpvaKxI0BTL00D98Qgi4d"
+STRIPE_PRICE_MENSAL = "price_1UIXzF7DWMRlw7GbvjYuP2gU"
+STRIPE_PRICE_ANUAL = "price_1UB1F57DWMRlw7GbECmPKeZc"
+VAPID_PUBLIC_KEY = "BM-3kiDuTjRMPdtnlWcYVqvLXQCLicOc0zMFHPmFZKxpA2UGE2LvP9ccoGyJHRMlNn04ZfitMHHLh3M3Fmr64ts"
+
+[triggers]
+crons = ["0 12 * * *", "*/5 * * * *"]
