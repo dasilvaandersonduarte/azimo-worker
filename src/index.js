@@ -2376,8 +2376,8 @@ async function verificarEDispararPush(env) {
   async function processarLista(row, tarefas, dataRefTarefa, cruzaMeiaNoite) {
     for (const t of tarefas) {
       if (!t.hora || t.feito) continue;
-      const antecedencia = (t.lembreteAntecedencia === 0 || t.lembreteAntecedencia) ? Number(t.lembreteAntecedencia) : null;
-      if (antecedencia === null) continue;
+      if (t.lembreteAntecedencia === null) continue; // "Sem lembrete" escolhido explicitamente
+      const antecedencia = (t.lembreteAntecedencia === 0 || t.lembreteAntecedencia) ? Number(t.lembreteAntecedencia) : 0;
       const [th, tm] = String(t.hora).split(':').map(Number);
       if (isNaN(th) || isNaN(tm)) continue;
       let minutosAlvo = th * 60 + tm - antecedencia;
