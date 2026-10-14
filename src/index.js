@@ -2316,6 +2316,18 @@ async function _enviarPush(sub, payloadObj, env) {
   return resp.ok;
 }
 
+// Item 271 do Backlog Mestre: texto humano pra antecedencia configuravel do lembrete,
+// espelha _fmtAntecedenciaTexto do index.html (client) pra manter o mesmo tom em
+// qualquer um dos dois caminhos (push real aqui, ou local quando o app esta aberto).
+function _fmtAntecedenciaTextoWorker(min, hora) {
+  if (min === 0) return 'esta marcado para agora, ' + hora + '.';
+  if (min === 10) return 'comeca em 10 minutos, as ' + hora + '.';
+  if (min === 30) return 'comeca em 30 minutos, as ' + hora + '.';
+  if (min === 60) return 'comeca em 1 hora, as ' + hora + '.';
+  if (min === 1440) return 'e amanha, as ' + hora + '.';
+  return 'comeca em breve, as ' + hora + '.';
+}
+
 async function verificarEDispararPush(env) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY || !env.VAPID_PRIVATE_KEY || !env.VAPID_PUBLIC_KEY) return;
 
@@ -2325,6 +2337,12 @@ async function verificarEDispararPush(env) {
   const hoje = fmtData.format(agora);
   const [hh, mm] = fmtHora.format(agora).split(':').map(Number);
   const minutosAgora = hh * 60 + mm;
+  // Calendario puro (sem fuso), so pra achar a chave de amanha a partir de hoje --
+  // precisamos dela pra pegar lembretes de tarefas de amanha cuja antecedencia (ex: 1
+  // dia antes) "estoura" pra hoje.
+  const [hy, hm, hd] = hoje.split('-').map(Number);
+  const amanhaDate = new Date(Date.UTC(hy, hm - 1, hd + 1));
+  const amanha = amanhaDate.getUTCFullYear() + '-' + String(amanhaDate.getUTCMonth() + 1).padStart(2, '0') + '-' + String(amanhaDate.getUTCDate()).padStart(2, '0');
 
   let subs = [];
   try {
@@ -2352,17 +2370,27 @@ async function verificarEDispararPush(env) {
   } catch (e) { console.error('push: erro ao buscar user_state', e.message); return; }
   console.log('push: estados encontrados =', estados.length, 'hoje =', hoje, 'minutosAgora =', minutosAgora);
 
-  for (const row of estados) {
-    const state = row.state || {};
-    const tarefas = (state.tarefasHoje && state.tarefasHoje[hoje]) || [];
+  // Processa uma lista de tarefas (de "hoje" ou de "amanha"). cruzaMeiaNoite=true
+  // significa que so interessam lembretes cuja antecedencia joga o horario de disparo
+  // pra TRAS da meia-noite (ou seja, pra hoje) -- usado so na lista de amanha.
+  async function processarLista(row, tarefas, dataRefTarefa, cruzaMeiaNoite) {
     for (const t of tarefas) {
       if (!t.hora || t.feito) continue;
+      const antecedencia = (t.lembreteAntecedencia === 0 || t.lembreteAntecedencia) ? Number(t.lembreteAntecedencia) : null;
+      if (antecedencia === null) continue;
       const [th, tm] = String(t.hora).split(':').map(Number);
       if (isNaN(th) || isNaN(tm)) continue;
-      const diff = minutosAgora - (th * 60 + tm);
+      let minutosAlvo = th * 60 + tm - antecedencia;
+      if (cruzaMeiaNoite) {
+        if (minutosAlvo >= 0) continue;
+        minutosAlvo += 1440;
+      } else {
+        if (minutosAlvo < 0) continue;
+      }
+      const diff = minutosAgora - minutosAlvo;
       if (diff < 0 || diff > 5) continue;
 
-      const chave = row.user_id + '_' + hoje + '_' + t.id + '_' + t.hora;
+      const chave = row.user_id + '_' + dataRefTarefa + '_' + t.id + '_' + t.hora + '_' + antecedencia;
       let jaEnviado = false;
       try {
         const insResp = await fetch(`${env.SUPABASE_URL}/rest/v1/push_enviados`, {
@@ -2381,10 +2409,10 @@ async function verificarEDispararPush(env) {
 
       const payload = {
         titulo: 'Sua Agenda \u00b7 Azimo',
-        corpo: (t.texto || 'Voce tem um compromisso') + ' esta marcado para agora, ' + t.hora + '.',
+        corpo: (t.texto || 'Voce tem um compromisso') + ' ' + _fmtAntecedenciaTextoWorker(antecedencia, t.hora),
         url: '/'
       };
-      console.log('push: tarefa batendo agora, disparando ->', row.user_id, t.texto, t.hora);
+      console.log('push: lembrete batendo agora, disparando ->', row.user_id, t.texto, t.hora, 'antecedencia=', antecedencia);
       for (const sub of (subsPorUsuario[row.user_id] || [])) {
         try {
           const ok = await _enviarPush(sub, payload, env);
@@ -2394,5 +2422,13 @@ async function verificarEDispararPush(env) {
         }
       }
     }
+  }
+
+  for (const row of estados) {
+    const state = row.state || {};
+    const tarefasHoje = (state.tarefasHoje && state.tarefasHoje[hoje]) || [];
+    const tarefasAmanha = (state.tarefasHoje && state.tarefasHoje[amanha]) || [];
+    await processarLista(row, tarefasHoje, hoje, false);
+    await processarLista(row, tarefasAmanha, amanha, true);
   }
 }
