@@ -1038,6 +1038,13 @@ async function handleTrialStartWithCard(request, env, origin) {
   const planKey = (plan_type === 'mensal' && STRIPE_PRICE_MENSAL) ? 'mensal' : 'anual';
   const stripePriceId = planKey === 'mensal' ? STRIPE_PRICE_MENSAL : STRIPE_PRICE_ANUAL;
 
+  // Item 294 (Anderson, 18/10): quem entra com um Codigo de Convite valido (o de
+  // rastreio, nao o de Acesso -- esse ja' e' tratado sem cartao em outro fluxo)
+  // ganha 15 dias gratuitos com cartao ja cadastrado, sem cobranca ate o fim do
+  // periodo. Decisao explicita do Anderson: pedir cartao so depois do trial gera
+  // mais abandono do que pedir ja no cadastro sem cobrar na hora.
+  const temTrialConvite = !!invitedCode;
+
   try {
     // 1. Criar Customer no Stripe
     const customer = await stripeRequest(env, 'POST', '/v1/customers', {
@@ -1051,17 +1058,20 @@ async function handleTrialStartWithCard(request, env, origin) {
       customer: customer.id,
     });
 
-    // 3. Criar Subscription anual, cobranca imediata (sem trial)
+    // 3. Criar Subscription -- com 15 dias de trial se veio de Codigo de Convite,
+    // cobranca imediata nos demais casos (decisao do Anderson, 30/08, mantida).
     const subscription = await stripeRequest(env, 'POST', '/v1/subscriptions', {
       customer: customer.id,
       'items[0][price]': stripePriceId,
       default_payment_method: payment_method_id,
       'payment_settings[save_default_payment_method]': 'on_subscription',
+      ...(temTrialConvite ? { trial_period_days: 15 } : {}),
     });
 
     const periodEndIso = new Date(subscription.current_period_end * 1000).toISOString();
 
-    // 4. Registrar subscriber no Supabase -- ja entra 'ativo', cobranca ja aconteceu na hora
+    // 4. Registrar subscriber no Supabase -- 'trial' durante os 15 dias gratuitos
+    // do convite, 'ativo' quando a cobranca ja aconteceu na hora (sem convite).
     await fetch(`${env.SUPABASE_URL}/rest/v1/subscribers`, {
       method: 'POST',
       headers: {
@@ -1073,7 +1083,7 @@ async function handleTrialStartWithCard(request, env, origin) {
       body: JSON.stringify({
         user_id,
         email,
-        status: 'ativo',
+        status: temTrialConvite ? 'trial' : 'ativo',
         plan_type: planKey,
         stripe_customer_id: customer.id,
         stripe_subscription_id: subscription.id,
@@ -1091,8 +1101,10 @@ async function handleTrialStartWithCard(request, env, origin) {
         body: JSON.stringify({
           from: 'Azimo <noreply@azimo.life>',
           to: ['dasilvaandersonduarte@gmail.com'],
-          subject: `Nova assinatura paga: ${nome || email}`,
-          html: `<h2>Novo cadastro com cartao, cobranca imediata</h2><p><strong>Nome:</strong> ${nome || 'Nao informado'}</p><p><strong>Email:</strong> ${email}</p><p><strong>Plano:</strong> ${planKey} (R$${(PRECO_ANUAL_CENTAVOS/100).toFixed(2).replace('.',',')})</p><p><strong>Stripe Customer:</strong> ${customer.id}</p><p><strong>Subscription:</strong> ${subscription.id}</p><p><strong>Renova em:</strong> ${new Date(periodEndIso).toLocaleDateString('pt-BR')}</p>`,
+          subject: temTrialConvite ? `Novo trial de convite (15 dias): ${nome || email}` : `Nova assinatura paga: ${nome || email}`,
+          html: temTrialConvite
+            ? `<h2>Novo cadastro via Codigo de Convite, 15 dias gratuitos</h2><p><strong>Nome:</strong> ${nome || 'Nao informado'}</p><p><strong>Email:</strong> ${email}</p><p><strong>Codigo usado:</strong> ${invitedCode}</p><p><strong>Plano:</strong> ${planKey} (R$${(PRECO_ANUAL_CENTAVOS/100).toFixed(2).replace('.',',')})</p><p><strong>Stripe Customer:</strong> ${customer.id}</p><p><strong>Subscription:</strong> ${subscription.id}</p><p><strong>Cartao cadastrado, sem cobranca ate:</strong> ${new Date(periodEndIso).toLocaleDateString('pt-BR')}</p>`
+            : `<h2>Novo cadastro com cartao, cobranca imediata</h2><p><strong>Nome:</strong> ${nome || 'Nao informado'}</p><p><strong>Email:</strong> ${email}</p><p><strong>Plano:</strong> ${planKey} (R$${(PRECO_ANUAL_CENTAVOS/100).toFixed(2).replace('.',',')})</p><p><strong>Stripe Customer:</strong> ${customer.id}</p><p><strong>Subscription:</strong> ${subscription.id}</p><p><strong>Renova em:</strong> ${new Date(periodEndIso).toLocaleDateString('pt-BR')}</p>`,
         }),
       }).catch(() => {});
     }
@@ -1111,6 +1123,9 @@ async function handleTrialStartWithCard(request, env, origin) {
         });
       };
 
+      const rodapeEmailD0 = temTrialConvite
+        ? `<p style="font-size:12px;color:#999;margin-top:24px">Você tem 15 dias gratuitos, sem cobrança nenhuma até lá. Se não for pra você, cancela direto no app antes do fim do período.</p>`
+        : `<p style="font-size:12px;color:#999;margin-top:24px">Se nos primeiros 7 dias você sentir que não é pra você, é só cancelar direto no app: reembolso integral, sem perguntas.</p>`;
       await sendEmail(
         `Vio aqui, ${primeiroNome}. Pode começar.`,
         `<div style="font-family:Georgia,serif;max-width:520px;margin:0 auto;color:#1a1a2e;line-height:1.7">
@@ -1119,7 +1134,7 @@ async function handleTrialStartWithCard(request, env, origin) {
           <p style="font-size:15px">Seu acesso está ativo. Esse email é curto porque o que precisa acontecer é dentro do app, não aqui.</p>
           <p style="font-size:15px">Antes de qualquer coisa: preencha seu perfil. É lá que eu entendo quem você é, onde você quer chegar e o que está travando. Sem isso, eu sou um chatbot genérico. Com isso, eu viro seu mentor de fato.</p>
           <a href="https://www.azimo.life?login=1" style="display:inline-block;background:#6366F1;color:#fff;padding:13px 30px;border-radius:8px;text-decoration:none;font-size:14px;font-weight:700;margin-top:8px">Abrir o Azimo agora</a>
-          <p style="font-size:12px;color:#999;margin-top:24px">Se nos primeiros 7 dias você sentir que não é pra você, é só cancelar direto no app: reembolso integral, sem perguntas.</p>
+          ${rodapeEmailD0}
         </div>`
       );
       await sendEmail(
