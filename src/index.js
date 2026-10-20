@@ -94,6 +94,10 @@ export default {
       if (!isAllowed) return new Response('Forbidden', { status: 403 });
       return handleBetaRedeem(request, env, origin);
     }
+    if (url.pathname === '/beta/status' && request.method === 'GET') {
+      if (!isAllowed) return new Response('Forbidden', { status: 403 });
+      return handleBetaStatus(request, env, origin);
+    }
 
     // ─── Stripe Customer Portal ───────────────────────────────────────
     if (url.pathname === '/customer-portal' && request.method === 'POST') {
@@ -919,9 +923,8 @@ async function handleBetaRedeem(request, env, origin) {
       });
     }
 
-    // Reaproveita o upsert ja usado por trial/assinatura paga, so muda status/plano.
-    // Isso faz o beta "existir" pro paywall/Command sem duplicar a logica de gate em outro lugar.
-    await upsertSubscriber(env, { email: userData.email, status: 'ativo', planType: 'beta' });
+    // A concessao so e confirmada depois de persistir o acesso para logins futuros.
+    await persistBetaSubscriber(env, userData);
 
     return new Response(JSON.stringify({ ok: true }), {
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': corsOrigin }
@@ -931,6 +934,56 @@ async function handleBetaRedeem(request, env, origin) {
       status: 500,
       headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': corsOrigin }
     });
+  }
+}
+
+async function persistBetaSubscriber(env, user) {
+  const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/subscribers`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': env.SUPABASE_SERVICE_KEY,
+      'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
+      'Prefer': 'resolution=merge-duplicates,return=minimal',
+    },
+    body: JSON.stringify({
+      user_id: user.id, email: user.email, status: 'ativo', plan_type: 'beta',
+      current_period_end: null, updated_at: new Date().toISOString(),
+    }),
+  });
+  if (!resp.ok) throw new Error('Falha ao registrar o acesso (' + resp.status + ')');
+}
+
+async function handleBetaStatus(request, env, origin) {
+  const headers = { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': origin };
+  try {
+    const token = (request.headers.get('Authorization') || '').replace(/^Bearer /, '').trim();
+    if (!token) return new Response(JSON.stringify({ active: false }), { status: 401, headers });
+    const auth = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+      headers: { 'apikey': env.SUPABASE_SERVICE_KEY, 'Authorization': 'Bearer ' + token }
+    });
+    if (!auth.ok) return new Response(JSON.stringify({ active: false }), { status: 401, headers });
+    const user = await auth.json();
+    const accessResp = await fetch(`${env.SUPABASE_URL}/rest/v1/azimo_beta_access?user_id=eq.${encodeURIComponent(user.id)}&revoked_at=is.null&select=invite_code&limit=1`, {
+      headers: { 'apikey': env.SUPABASE_SERVICE_KEY, 'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY }
+    });
+    if (!accessResp.ok) throw new Error('Falha ao verificar acesso');
+    const access = (await accessResp.json())[0];
+    if (!access) return new Response(JSON.stringify({ active: false }), { headers });
+    const inviteResp = await fetch(`${env.SUPABASE_URL}/rest/v1/azimo_beta_invites?code=eq.${encodeURIComponent(access.invite_code)}&revoked_at=is.null&select=code&limit=1`, {
+      headers: { 'apikey': env.SUPABASE_SERVICE_KEY, 'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY }
+    });
+    if (!inviteResp.ok) throw new Error('Falha ao verificar convite');
+    if (!(await inviteResp.json()).length) return new Response(JSON.stringify({ active: false }), { headers });
+    const subResp = await fetch(`${env.SUPABASE_URL}/rest/v1/subscribers?user_id=eq.${encodeURIComponent(user.id)}&select=status,plan_type&limit=1`, {
+      headers: { 'apikey': env.SUPABASE_SERVICE_KEY, 'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY }
+    });
+    if (!subResp.ok) throw new Error('Falha ao verificar assinatura');
+    const sub = (await subResp.json())[0];
+    if (!sub || sub.plan_type === 'beta') await persistBetaSubscriber(env, user);
+    return new Response(JSON.stringify({ active: true }), { headers });
+  } catch (err) {
+    return new Response(JSON.stringify({ error: err.message }), { status: 500, headers });
   }
 }
 
