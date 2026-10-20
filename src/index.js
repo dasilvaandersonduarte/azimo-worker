@@ -754,6 +754,10 @@ async function handleBetaInviteCreate(request, env, origin) {
     const admin = await requireAdminBeta(request, env, corsOrigin);
     if (admin.error) return admin.error;
 
+    let body;
+    try { body = await request.json(); } catch { return new Response(JSON.stringify({error:'Dados inválidos.'}), {status:400,headers:{'Content-Type':'application/json','Access-Control-Allow-Origin':corsOrigin}}); }
+    const nome = String(body.destinatario_nome || '').trim();
+    if (!nome || nome.length > 120) return new Response(JSON.stringify({error:'Informe o nome da pessoa (até 120 caracteres).'}), {status:400,headers:{'Content-Type':'application/json','Access-Control-Allow-Origin':corsOrigin}});
     const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/azimo_beta_invites`, {
       method: 'POST',
       headers: {
@@ -762,7 +766,7 @@ async function handleBetaInviteCreate(request, env, origin) {
         'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
         'Prefer': 'return=representation',
       },
-      body: JSON.stringify({ created_by: admin.userId }),
+      body: JSON.stringify({ created_by: admin.userId, destinatario_nome: nome }),
     });
     if (!resp.ok) throw new Error('Falha ao criar convite (' + resp.status + ')');
     const rows = await resp.json();
@@ -2334,30 +2338,48 @@ async function _enviarPush(sub, payloadObj, env) {
 // Item 271 do Backlog Mestre: texto humano pra antecedencia configuravel do lembrete,
 // espelha _fmtAntecedenciaTexto do index.html (client) pra manter o mesmo tom em
 // qualquer um dos dois caminhos (push real aqui, ou local quando o app esta aberto).
-function _fmtAntecedenciaTextoWorker(min, hora) {
-  if (min === 0) return 'esta marcado para agora, ' + hora + '.';
-  if (min === 10) return 'comeca em 10 minutos, as ' + hora + '.';
-  if (min === 30) return 'comeca em 30 minutos, as ' + hora + '.';
-  if (min === 60) return 'comeca em 1 hora, as ' + hora + '.';
-  if (min === 1440) return 'e amanha, as ' + hora + '.';
-  return 'comeca em breve, as ' + hora + '.';
+const LEMBRETE_UNIDADES = {minuto:1,hora:60,dia:1440,semana:10080,mes:0,ano:0};
+function _configLembreteWorker(t){
+  if(t.lembreteConfig===null || (t.lembreteConfig===undefined && t.lembreteAntecedencia===null))return null;
+  const c=t.lembreteConfig;
+  if(c && Object.hasOwn(LEMBRETE_UNIDADES,c.unidade) && Number.isInteger(Number(c.quantidade)) && Number(c.quantidade)>=0 && Number(c.quantidade)<=99)
+    return {quantidade:Number(c.quantidade),unidade:c.unidade};
+  const min=Number(t.lembreteAntecedencia||0);
+  for(const [unit,mul] of [['semana',10080],['dia',1440],['hora',60],['minuto',1]])
+    if(min>=mul && min%mul===0 && min/mul<=99)return {quantidade:min/mul,unidade:unit};
+  return {quantidade:0,unidade:'minuto'};
+}
+function _instanteLembreteWorker(data,hora,cfg){
+  if(!cfg||!/^\d{4}-\d{2}-\d{2}$/.test(data)||!/^\d{2}:\d{2}$/.test(hora))return NaN;
+  const [y,m,d]=data.split('-').map(Number),[h,mi]=hora.split(':').map(Number);
+  if(m<1||m>12||h>23||mi>59)return NaN;
+  const original=new Date(Date.UTC(y,m-1,d,h,mi));
+  if(original.getUTCFullYear()!==y||original.getUTCMonth()!==m-1||original.getUTCDate()!==d)return NaN;
+  if(cfg.unidade==='mes'||cfg.unidade==='ano'){
+    const total=y*12+m-1-(cfg.unidade==='mes'?cfg.quantidade:cfg.quantidade*12);
+    const ty=Math.floor(total/12),tm=((total%12)+12)%12;
+    return Date.UTC(ty,tm,Math.min(d,new Date(Date.UTC(ty,tm+1,0)).getUTCDate()),h,mi);
+  }
+  return original.getTime()-cfg.quantidade*LEMBRETE_UNIDADES[cfg.unidade]*60000;
+}
+function _fmtAntecedenciaTextoWorker(cfg,hora){
+  const n=cfg.quantidade;
+  if(!n)return 'esta marcado para agora, as '+hora+'.';
+  const plural={minuto:['minuto','minutos'],hora:['hora','horas'],dia:['dia','dias'],semana:['semana','semanas'],mes:['mes','meses'],ano:['ano','anos']};
+  return 'comeca em '+n+' '+plural[cfg.unidade][n===1?0:1]+', as '+hora+'.';
 }
 
 async function verificarEDispararPush(env) {
   if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY || !env.VAPID_PRIVATE_KEY || !env.VAPID_PUBLIC_KEY) return;
 
   const fmtData = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year: 'numeric', month: '2-digit', day: '2-digit' });
-  const fmtHora = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false });
+  const fmtHora = new Intl.DateTimeFormat('pt-BR', { timeZone: 'America/Sao_Paulo', hour: '2-digit', minute: '2-digit', hour12: false, hourCycle:'h23' });
   const agora = new Date();
   const hoje = fmtData.format(agora);
   const [hh, mm] = fmtHora.format(agora).split(':').map(Number);
   const minutosAgora = hh * 60 + mm;
-  // Calendario puro (sem fuso), so pra achar a chave de amanha a partir de hoje --
-  // precisamos dela pra pegar lembretes de tarefas de amanha cuja antecedencia (ex: 1
-  // dia antes) "estoura" pra hoje.
-  const [hy, hm, hd] = hoje.split('-').map(Number);
-  const amanhaDate = new Date(Date.UTC(hy, hm - 1, hd + 1));
-  const amanha = amanhaDate.getUTCFullYear() + '-' + String(amanhaDate.getUTCMonth() + 1).padStart(2, '0') + '-' + String(amanhaDate.getUTCDate()).padStart(2, '0');
+  const [cy,cm,cd]=hoje.split('-').map(Number);
+  const agoraCalendario=Date.UTC(cy,cm-1,cd,hh,mm);
 
   let subs = [];
   try {
@@ -2385,65 +2407,35 @@ async function verificarEDispararPush(env) {
   } catch (e) { console.error('push: erro ao buscar user_state', e.message); return; }
   console.log('push: estados encontrados =', estados.length, 'hoje =', hoje, 'minutosAgora =', minutosAgora);
 
-  // Processa uma lista de tarefas (de "hoje" ou de "amanha"). cruzaMeiaNoite=true
-  // significa que so interessam lembretes cuja antecedencia joga o horario de disparo
-  // pra TRAS da meia-noite (ou seja, pra hoje) -- usado so na lista de amanha.
-  async function processarLista(row, tarefas, dataRefTarefa, cruzaMeiaNoite) {
-    for (const t of tarefas) {
-      if (!t.hora || t.feito) continue;
-      if (t.lembreteAntecedencia === null) continue; // "Sem lembrete" escolhido explicitamente
-      const antecedencia = (t.lembreteAntecedencia === 0 || t.lembreteAntecedencia) ? Number(t.lembreteAntecedencia) : 0;
-      const [th, tm] = String(t.hora).split(':').map(Number);
-      if (isNaN(th) || isNaN(tm)) continue;
-      let minutosAlvo = th * 60 + tm - antecedencia;
-      if (cruzaMeiaNoite) {
-        if (minutosAlvo >= 0) continue;
-        minutosAlvo += 1440;
-      } else {
-        if (minutosAlvo < 0) continue;
-      }
-      const diff = minutosAgora - minutosAlvo;
-      if (diff < 0 || diff > 5) continue;
-
-      const chave = row.user_id + '_' + dataRefTarefa + '_' + t.id + '_' + t.hora + '_' + antecedencia;
-      let jaEnviado = false;
-      try {
-        const insResp = await fetch(`${env.SUPABASE_URL}/rest/v1/push_enviados`, {
-          method: 'POST',
-          headers: {
-            'apikey': env.SUPABASE_SERVICE_KEY,
-            'Authorization': 'Bearer ' + env.SUPABASE_SERVICE_KEY,
-            'Content-Type': 'application/json',
-            'Prefer': 'return=minimal'
-          },
-          body: JSON.stringify({ chave, user_id: row.user_id })
+  async function processarLista(row, tarefas, dataRefTarefa){
+    for(const t of tarefas||[]){
+      if(!t.hora||t.feito)continue;
+      const cfg=_configLembreteWorker(t);
+      if(!cfg)continue;
+      const alvo=_instanteLembreteWorker(dataRefTarefa,String(t.hora),cfg);
+      if(!Number.isFinite(alvo))continue;
+      const diff=Math.floor((agoraCalendario-alvo)/60000);
+      if(diff<0||diff>5)continue;
+      const chave=row.user_id+'_'+dataRefTarefa+'_'+t.id+'_'+t.hora+'_'+cfg.quantidade+'_'+cfg.unidade;
+      let jaEnviado=false;
+      try{
+        const insResp=await fetch(`${env.SUPABASE_URL}/rest/v1/push_enviados`,{
+          method:'POST',
+          headers:{'apikey':env.SUPABASE_SERVICE_KEY,'Authorization':'Bearer '+env.SUPABASE_SERVICE_KEY,'Content-Type':'application/json','Prefer':'return=minimal'},
+          body:JSON.stringify({chave,user_id:row.user_id})
         });
-        if (!insResp.ok) jaEnviado = true;
-      } catch (e) { jaEnviado = true; }
-      if (jaEnviado) continue;
-
-      const payload = {
-        titulo: 'Sua Agenda \u00b7 Azimo',
-        corpo: (t.texto || 'Voce tem um compromisso') + ' ' + _fmtAntecedenciaTextoWorker(antecedencia, t.hora),
-        url: '/'
-      };
-      console.log('push: lembrete batendo agora, disparando ->', row.user_id, t.texto, t.hora, 'antecedencia=', antecedencia);
-      for (const sub of (subsPorUsuario[row.user_id] || [])) {
-        try {
-          const ok = await _enviarPush(sub, payload, env);
-          console.log('push: envio', ok ? 'OK' : 'FALHOU', sub.endpoint.slice(0, 60));
-        } catch (e) {
-          console.error('push: excecao no envio', e.message, e.stack);
-        }
+        if(!insResp.ok)jaEnviado=true;
+      }catch(e){jaEnviado=true}
+      if(jaEnviado)continue;
+      const payload={titulo:'Sua Agenda · Azimo',corpo:(t.texto||'Você tem uma tarefa')+' '+_fmtAntecedenciaTextoWorker(cfg,t.hora),url:'/'};
+      for(const sub of subsPorUsuario[row.user_id]||[]){
+        try{await _enviarPush(sub,payload,env)}catch(e){console.error('push: falha no envio',e.message)}
       }
     }
   }
-
-  for (const row of estados) {
-    const state = row.state || {};
-    const tarefasHoje = (state.tarefasHoje && state.tarefasHoje[hoje]) || [];
-    const tarefasAmanha = (state.tarefasHoje && state.tarefasHoje[amanha]) || [];
-    await processarLista(row, tarefasHoje, hoje, false);
-    await processarLista(row, tarefasAmanha, amanha, true);
+  for(const row of estados){
+    const todas=(row.state||{}).tarefasHoje||{};
+    for(const [data,tarefas] of Object.entries(todas))
+      await processarLista(row,tarefas,data);
   }
 }
