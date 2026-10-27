@@ -10,4 +10,4 @@ STRIPE_PRICE_ANUAL = "price_1UB1F57DWMRlw7GbECmPKeZc"
 VAPID_PUBLIC_KEY = "BM-3kiDuTjRMPdtnlWcYVqvLXQCLicOc0zMFHPmFZKxpA2UGE2LvP9ccoGyJHRMlNn04ZfitMHHLh3M3Fmr64ts"
 
 [triggers]
-crons = ["0 12 * * *", "*/5 * * * *"]
+crons = ["0 12 * * *", "*/5 * * * *", "0 10 * * *", "0 23 * * *"]

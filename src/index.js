@@ -171,6 +171,10 @@ export default {
   async scheduled(event, env, ctx) {
     if (event.cron === '*/5 * * * *') {
       ctx.waitUntil(verificarEDispararPush(env));
+    } else if (event.cron === '0 10 * * *') {
+      ctx.waitUntil(verificarIncentivoDiario(env, 'manha'));
+    } else if (event.cron === '0 23 * * *') {
+      ctx.waitUntil(verificarIncentivoDiario(env, 'noite'));
     } else {
       ctx.waitUntil(checkReengagement(env));
     }
@@ -2490,5 +2494,203 @@ async function verificarEDispararPush(env) {
     const todas=(row.state||{}).tarefasHoje||{};
     for(const [data,tarefas] of Object.entries(todas))
       await processarLista(row,tarefas,data);
+  }
+}
+
+// ─── Incentivo diario (manha e noite -- item 366, 2a fase) ──────────────────
+// Dois horarios fixos em America/Sao_Paulo (cron sempre em UTC: 10h UTC =
+// 7h BRT pra manha, 23h UTC = 20h BRT pra noite). Reusa a mesma tabela de
+// inscricoes e o mesmo _enviarPush de verificarEDispararPush -- nenhuma
+// infraestrutura nova, so' um criterio de decisao novo por periodo. Regra de
+// cadencia (combinada com o Anderson): no maximo 1 notificacao de incentivo
+// por usuario por dia, nunca empilhando tipos diferentes no mesmo dia. A
+// checagem de manha e' feita primeiro (cron das 10h UTC roda antes do das
+// 23h); a checagem de noite consulta se a manha ja mandou algo hoje antes de
+// decidir, pra nunca estourar o limite diario.
+
+function _diaConcluidoOuFoco(state, data){
+  return !!((state?.diasConcluidos||{})[data] || (state?.focoAzimoDias||{})[data]);
+}
+
+// Sequencia de dias consecutivos ANTERIORES a hoje (nao conta hoje, que ainda
+// esta em andamento) com dia fechado ou Foco Azimo usado.
+function _streakAtualWorker(state, hojeStr){
+  let streak = 0;
+  const [y,m,d] = hojeStr.split('-').map(Number);
+  let cursor = new Date(Date.UTC(y, m-1, d));
+  for(let i=0;i<60;i++){
+    cursor = new Date(cursor.getTime() - 86400000);
+    const key = cursor.toISOString().slice(0,10);
+    if(_diaConcluidoOuFoco(state, key)) streak++;
+    else break;
+  }
+  return streak;
+}
+
+// Nos ultimos 14 dias anteriores a hoje, a pessoa usou mais o Foco Azimo ou
+// mais o fechamento manual do dia (sem ter usado o Foco Azimo)? Retorna true
+// (prefere Foco Azimo), false (prefere manual) ou null (sem historico
+// suficiente pra decidir -- nesse caso a manha fica em silencio, ver
+// _decidirIncentivoManha).
+function _prefereFocoAzimoWorker(state, hojeStr){
+  const foco = state?.focoAzimoDias || {};
+  const diasFechados = state?.diasConcluidos || {};
+  let diasAtivosFoco = 0, diasAtivosTotal = 0;
+  const [y,m,d] = hojeStr.split('-').map(Number);
+  let cursor = new Date(Date.UTC(y, m-1, d));
+  for(let i=0;i<14;i++){
+    cursor = new Date(cursor.getTime() - 86400000);
+    const key = cursor.toISOString().slice(0,10);
+    const ativoFoco = !!foco[key];
+    const ativoDia = !!diasFechados[key];
+    if(ativoFoco || ativoDia) diasAtivosTotal++;
+    if(ativoFoco) diasAtivosFoco++;
+  }
+  if(diasAtivosTotal === 0) return null;
+  return (diasAtivosFoco / diasAtivosTotal) >= 0.5;
+}
+
+// Replica a formula de weekNumber()+_anoSemanaKey() do index.html (chave que
+// STATE.vioAnaliseSemanalGerada usa), a partir da data de hoje em
+// America/Sao_Paulo, pra bater com a mesma chave que o front gerou.
+function _anoSemanaKeyWorker(hojeStr){
+  const [y,m,d] = hojeStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m-1, d));
+  const jan1 = new Date(Date.UTC(y, 0, 1));
+  const semana = Math.ceil((((dt-jan1)/86400000)+jan1.getUTCDay()+1)/7);
+  return y+'-S'+semana;
+}
+
+const _CODIGOS_MANHA = ['manha_foco','manha_tarefas','reativacao'];
+
+async function _jaIncentivouHojeDeManha(env, userId, hojeStr){
+  try{
+    const chaves = _CODIGOS_MANHA.map(c=>`"${userId}_${hojeStr}_${c}"`).join(',');
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/push_enviados?chave=in.(${chaves})&select=chave&limit=1`, {
+      headers:{apikey:env.SUPABASE_SERVICE_KEY, Authorization:'Bearer '+env.SUPABASE_SERVICE_KEY}
+    });
+    if(!resp.ok) return false;
+    const rows = await resp.json();
+    return rows.length > 0;
+  }catch(e){ return false; }
+}
+
+// Decide o que mandar de manha (ou nada). Prioridade: reativacao por
+// inatividade real > mensagem personalizada pelo padrao de uso de cada um >
+// silencio (quem ja engajou hoje, ou quem ainda nao tem padrao de uso
+// estabelecido pra personalizar com base real em vez de generico).
+function _decidirIncentivoManha(row, state, hojeStr){
+  const tarefasHojeArr = (state.tarefasHoje || {})[hojeStr];
+  const jaTemTarefasHoje = Array.isArray(tarefasHojeArr) && tarefasHojeArr.length > 0;
+  const jaUsouFocoHoje = !!(state.focoAzimoDias || {})[hojeStr];
+  if(jaTemTarefasHoje || jaUsouFocoHoje) return null;
+
+  const agora = Date.now();
+  const diasSemAtualizar = row.updated_at ? (agora - new Date(row.updated_at).getTime()) / 86400000 : Infinity;
+  if(diasSemAtualizar >= 3){
+    return { codigo:'reativacao', titulo:'Sentimos sua falta · Azimo', corpo:'Faz uns dias que você não aparece por aqui. Não precisa recuperar tudo de uma vez, só dar o próximo passo.' };
+  }
+
+  const preferencia = _prefereFocoAzimoWorker(state, hojeStr);
+  if(preferencia === true){
+    return { codigo:'manha_foco', titulo:'Bom dia · Azimo', corpo:'Hora de abrir o Foco Azimo e começar o dia com direção, do seu jeito de sempre.' };
+  }
+  if(preferencia === false){
+    return { codigo:'manha_tarefas', titulo:'Bom dia · Azimo', corpo:'Hora de organizar as tarefas de hoje antes que o dia tome conta sozinho.' };
+  }
+  return null; // sem historico de uso suficiente -- nao empurra algo generico sem base real
+}
+
+// Decide o que mandar a noite (ou nada). Prioridade combinada com o Anderson:
+// sequencia em risco > tarefa em aberto > habito sem check > analise semanal
+// pronta (a analise so' compete quando nenhum dos outros 3 se aplicou nesse
+// dia, e so' dispara 1x por semana gracas a chave usar _anoSemanaKeyWorker em
+// vez da data do dia).
+function _decidirIncentivoNoite(state, hojeStr){
+  const diaJaFechado = !!(state.diasConcluidos || {})[hojeStr];
+  if(diaJaFechado) return null;
+
+  const streak = _streakAtualWorker(state, hojeStr);
+  if(streak >= 2){
+    return { codigo:'streak_risco', titulo:`Sua sequência está em ${streak} dias · Azimo`, corpo:'Não deixa isso parar hoje. Fechar o dia agora mantém a sequência viva.' };
+  }
+
+  const tarefasHojeArr = (state.tarefasHoje || {})[hojeStr] || [];
+  const temTarefaAberta = Array.isArray(tarefasHojeArr) && tarefasHojeArr.some(t => !t.feito);
+  if(temTarefaAberta){
+    return { codigo:'tarefa_aberta', titulo:'Ainda dá tempo · Azimo', corpo:'Você tem tarefa de hoje que ainda não foi concluída. Dá uma olhada antes de encerrar o dia.' };
+  }
+
+  const habitosDoUsuario = Array.isArray(state.habitos) ? state.habitos : [];
+  const tracker = state.tracker || {};
+  const temHabitoSemCheck = habitosDoUsuario.some(h => tracker[h.id+'_'+hojeStr] !== true);
+  if(temHabitoSemCheck){
+    return { codigo:'habito_aberto', titulo:'Hábito do dia · Azimo', corpo:'Ainda falta marcar seu hábito de hoje. Leva menos de um minuto.' };
+  }
+
+  const chaveSemana = _anoSemanaKeyWorker(hojeStr);
+  if((state.vioAnaliseSemanalGerada||{})[chaveSemana]){
+    return { codigo:'analise_semanal_'+chaveSemana, titulo:'Sua análise semanal está pronta · Azimo', corpo:'O Vio já olhou sua semana e preparou uma análise pra você.', semanal:true };
+  }
+
+  return null;
+}
+
+async function verificarIncentivoDiario(env, periodo){
+  if (!env.SUPABASE_URL || !env.SUPABASE_SERVICE_KEY || !env.VAPID_PRIVATE_KEY || !env.VAPID_PUBLIC_KEY) return;
+
+  const fmtData = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Sao_Paulo', year:'numeric', month:'2-digit', day:'2-digit' });
+  const hoje = fmtData.format(new Date());
+
+  let subs = [];
+  try{
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/push_subscriptions?select=user_id,endpoint,p256dh,auth_key`, {
+      headers:{apikey:env.SUPABASE_SERVICE_KEY, Authorization:'Bearer '+env.SUPABASE_SERVICE_KEY}
+    });
+    if(!resp.ok) { console.error('incentivo: falha ao buscar push_subscriptions', resp.status); return; }
+    subs = await resp.json();
+  }catch(e){ console.error('incentivo: erro ao buscar push_subscriptions', e.message); return; }
+  if(!subs.length) return;
+  const userIds = [...new Set(subs.map(s=>s.user_id))];
+  const subsPorUsuario = {};
+  subs.forEach(s => (subsPorUsuario[s.user_id] ||= []).push(s));
+
+  let estados = [];
+  try{
+    const idsFiltro = userIds.map(id=>`"${id}"`).join(',');
+    const resp = await fetch(`${env.SUPABASE_URL}/rest/v1/user_state?user_id=in.(${idsFiltro})&select=user_id,state,updated_at`, {
+      headers:{apikey:env.SUPABASE_SERVICE_KEY, Authorization:'Bearer '+env.SUPABASE_SERVICE_KEY}
+    });
+    if(!resp.ok) { console.error('incentivo: falha ao buscar user_state', resp.status); return; }
+    estados = await resp.json();
+  }catch(e){ console.error('incentivo: erro ao buscar user_state', e.message); return; }
+
+  for(const row of estados){
+    const state = row.state || {};
+    let tipo = null;
+    if(periodo === 'manha'){
+      tipo = _decidirIncentivoManha(row, state, hoje);
+    } else {
+      const jaMandouDeManha = await _jaIncentivouHojeDeManha(env, row.user_id, hoje);
+      if(!jaMandouDeManha) tipo = _decidirIncentivoNoite(state, hoje);
+    }
+    if(!tipo) continue;
+
+    const chave = tipo.semanal ? (row.user_id+'_'+tipo.codigo) : (row.user_id+'_'+hoje+'_'+tipo.codigo);
+    let jaEnviado = false;
+    try{
+      const ins = await fetch(`${env.SUPABASE_URL}/rest/v1/push_enviados`,{
+        method:'POST',
+        headers:{apikey:env.SUPABASE_SERVICE_KEY, Authorization:'Bearer '+env.SUPABASE_SERVICE_KEY, 'Content-Type':'application/json', 'Prefer':'return=minimal'},
+        body: JSON.stringify({chave, user_id: row.user_id})
+      });
+      if(!ins.ok) jaEnviado = true;
+    }catch(e){ jaEnviado = true; }
+    if(jaEnviado) continue;
+
+    for(const sub of subsPorUsuario[row.user_id]||[]){
+      try{ await _enviarPush(sub, {titulo:tipo.titulo, corpo:tipo.corpo, url:'/'}, env); }
+      catch(e){ console.error('incentivo: falha no envio', e.message); }
+    }
   }
 }
